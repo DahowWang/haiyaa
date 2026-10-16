@@ -1,0 +1,11 @@
+# 編譯產物與環境（都可以重新產生）
+client/.build/
+client/.swiftpm/
+server/.venv/
+__pycache__/
+*.pyc
+# 紀錄檔、系統檔
+*.log
+.DS_Store
+# 內部開發筆記（含本機路徑），不進 repo
+client/docs/obsidian-pending/
