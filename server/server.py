@@ -4,7 +4,7 @@ POST /dictate  body: {"audio_b64": <16kHz 單聲道 16-bit WAV 的 base64>, "con
           回傳: {"id", "text", "raw_a", "raw_b", "timings"}
 GET  /health
 
-流程：turbo 與 Breeze 各辨識一次 → 兩份加上畫面上下文交給 LLM 挑選潤飾 → 寫進 history.db。
+流程：turbo 辨識（精準模式再加跑 Breeze）→ 加上畫面上下文交給 LLM 潤飾 → 寫進 history.db。
 LLM 目前走 `claude -p`（預先開好備用程序，見 WarmClaude），之後換成直接打 API 只要改 refine()。
 """
 import base64
@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import mlx.core as mx
 import mlx_whisper
 import numpy as np
 from mlx_whisper.load_models import load_model
@@ -79,12 +80,27 @@ def apply_fixes(text, fixes):
 
 # mlx_whisper 只快取一個模型，兩個模型輪流用會一直重載，所以換成可以放多個的快取
 _models = {}
+_last_used = {}
+# Breeze 只有精準模式會用到，閒置這麼久就卸載，省下約 1.5 GB（下次用到再載入，多花約 1 秒）
+IDLE_UNLOAD = {MODEL_B: 10 * 60}
 
 
 def _get_model(cls, path, dtype):
     if path not in _models:
         _models[path] = load_model(path, dtype=dtype)
+    _last_used[path] = time.time()
     return _models[path]
+
+
+def _unload_idle_loop():
+    while True:
+        time.sleep(60)
+        for path, limit in IDLE_UNLOAD.items():
+            if path in _models and time.time() - _last_used.get(path, 0) > limit:
+                with gpu:
+                    _models.pop(path, None)
+                    mx.clear_cache()
+                print(f"閒置卸載模型：{path}", flush=True)
 
 
 # 套件把 transcribe 函式匯出成同名屬性，蓋掉了模組，要用 importlib 才拿得到模組本身
@@ -145,6 +161,8 @@ def asr(audio, model, terms):
                                    # 不做溫度重試：重試只會在幻覺上多花好幾秒，結果還是被 REPEAT_LOOP 擋掉
                                    temperature=0.0,
                                    sample_len=int(min(seconds, 30) * 12) + 16)
+        # MLX 會把用完的運算暫存留著重用，不清的話常駐記憶體會多出好幾 GB
+        mx.clear_cache()
     text = r["text"].strip()
     if REPEAT_LOOP.search(text):
         return ""
@@ -324,6 +342,7 @@ def warm_up():
     try:
         mlx_whisper.transcribe(np.zeros(16000, np.float32), path_or_hf_repo=MODEL_A,
                                language="zh", temperature=0.0, sample_len=8)
+        mx.clear_cache()
     finally:
         gpu.release()
 
@@ -339,7 +358,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"ok": True, "models": list(_models)})
+            self._send(200, {"ok": True, "models": list(_models),
+                             "gpu_mb": round(mx.get_active_memory() / 2**20),
+                             "cache_mb": round(mx.get_cache_memory() / 2**20)})
         else:
             self._send(404, {"error": "not found"})
 
@@ -363,7 +384,9 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print("載入模型中…", flush=True)
     silence = np.zeros(16000, np.float32)
-    for m in (MODEL_A, MODEL_B):
-        mlx_whisper.transcribe(silence, path_or_hf_repo=m, language="zh")
+    # 只預載 turbo；Breeze 等精準模式第一次用到才載
+    mlx_whisper.transcribe(silence, path_or_hf_repo=MODEL_A, language="zh")
+    mx.clear_cache()
+    threading.Thread(target=_unload_idle_loop, daemon=True).start()
     print(f"VoiceType 服務啟動：http://{HOST}:{PORT}", flush=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
