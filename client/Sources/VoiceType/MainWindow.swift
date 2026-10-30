@@ -289,8 +289,8 @@ private struct HistoryRow: View {
             if expanded {
                 Divider()
                 Text(entry.final.isEmpty ? "（沒有文字）" : entry.final).textSelection(.enabled)
-                rawText("原始辨識 A", text: entry.rawA)
-                rawText("原始辨識 B", text: entry.rawB)
+                rawText("原始辨識", text: entry.rawA)
+                if !entry.rawB.isEmpty { rawText("原始辨識（Breeze）", text: entry.rawB) }
                 HStack {
                     Label(entry.usedFallback ? "已退回原始辨識" : "未使用退回結果",
                           systemImage: entry.usedFallback ? "arrow.uturn.backward" : "checkmark.circle")
@@ -329,7 +329,7 @@ private struct HistoryRow: View {
     }
 
     private func timingName(_ key: String) -> String {
-        ["asr_a": "模型 A 辨識", "asr_b": "模型 B 辨識", "llm": "文字潤飾", "total": "總處理時間",
+        ["asr_a": "語音辨識", "asr_b": "Breeze 辨識", "llm": "文字潤飾", "total": "總處理時間",
          "context": "擷取上下文", "refine": "文字潤飾", "decode": "音訊解碼"][key] ?? "其他階段（\(key)）"
     }
 }

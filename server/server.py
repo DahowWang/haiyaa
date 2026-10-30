@@ -1,14 +1,13 @@
 """VoiceType 本機辨識服務。
 
 POST /dictate  body: {"audio_b64": <16kHz 單聲道 16-bit WAV 的 base64>, "context": {...}}
-          回傳: {"id", "text", "raw_a", "raw_b", "timings"}
+          回傳: {"id", "text", "raw_a", "timings"}
 GET  /health
 
-流程：turbo 辨識（精準模式再加跑 Breeze）→ 加上畫面上下文交給 LLM 潤飾 → 寫進 history.db。
+流程：turbo 辨識 → 加上畫面上下文交給 LLM 潤飾 → 寫進 history.db。
 LLM 目前走 `claude -p`（預先開好備用程序，見 WarmClaude），之後換成直接打 API 只要改 refine()。
 """
 import base64
-import importlib
 import io
 import json
 import os
@@ -26,13 +25,11 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_whisper
 import numpy as np
-from mlx_whisper.load_models import load_model
 from opencc import OpenCC
 
 HOST = os.environ.get("VOICETYPE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICETYPE_PORT", "5577"))
 MODEL_A = "mlx-community/whisper-large-v3-turbo"
-MODEL_B = os.path.expanduser("~/.cache/breeze-asr-25/mlx-q8")
 LLM_MODEL = os.environ.get("VOICETYPE_LLM", "sonnet")
 
 DATA = Path(os.path.expanduser("~/Library/Application Support/VoiceType"))
@@ -78,45 +75,14 @@ def apply_fixes(text, fixes):
         text = re.sub(r"\s*".join(map(re.escape, wrong.split())), fixes[wrong], text, flags=re.I)
     return text
 
-# mlx_whisper 只快取一個模型，兩個模型輪流用會一直重載，所以換成可以放多個的快取
-_models = {}
-_last_used = {}
-# Breeze 只有精準模式會用到，閒置這麼久就卸載，省下約 1.5 GB（下次用到再載入，多花約 1 秒）
-IDLE_UNLOAD = {MODEL_B: 10 * 60}
-
-
-def _get_model(cls, path, dtype):
-    if path not in _models:
-        _models[path] = load_model(path, dtype=dtype)
-    _last_used[path] = time.time()
-    return _models[path]
-
-
-def _unload_idle_loop():
-    while True:
-        time.sleep(60)
-        for path, limit in IDLE_UNLOAD.items():
-            if path in _models and time.time() - _last_used.get(path, 0) > limit:
-                with gpu:
-                    _models.pop(path, None)
-                    mx.clear_cache()
-                print(f"閒置卸載模型：{path}", flush=True)
-
-
-# 套件把 transcribe 函式匯出成同名屬性，蓋掉了模組，要用 importlib 才拿得到模組本身
-importlib.import_module("mlx_whisper.transcribe").ModelHolder.get_model = classmethod(_get_model)
-
 # 同一顆 GPU，一次只跑一個辨識
 gpu = threading.Lock()
 
 # Whisper 在靜音或極短片段常見的幻覺輸出
 HALLUCINATIONS = re.compile(r"(字幕|訂閱|點贊|點讚|歡迎收看|謝謝觀看|謝謝大家|Amara|請不吝)")
 
-SYSTEM = """你是語音輸入法的文字潤飾器。輸入是語音辨識的結果，可能只有一份 <a>，也可能有兩份：
-<a> 模型 A：有標點，但中文同音字錯得較多，長段落可能變成簡體。
-<b> 模型 B（不一定有）：繁體、沒有標點、英文全小寫；中文用詞通常較準，但偶爾把詞聽成別的詞。
-有兩份時，它們的錯誤大多不重疊，請逐句對照，每個有出入的地方選語意較通順、較合理的版本。
-只有 <a> 時，依發音和上下文修正同音錯字與聽錯的詞。
+SYSTEM = """你是語音輸入法的文字潤飾器。<a> 是語音辨識的結果：有標點，但中文同音字錯得較多，長段落可能變成簡體。
+請依發音和上下文修正同音錯字與聽錯的詞。
 <context> 是使用者講話當下的畫面資訊（App、視窗標題、游標前後文字）。只有在某個詞的發音跟上下文裡的詞相近時，才採用上下文的寫法；發音差很多就照辨識結果，不要硬套。
 規則：
 - 輸出台灣繁體中文，英文詞保留英文並修正拼字與大小寫。
@@ -128,6 +94,7 @@ SYSTEM = """你是語音輸入法的文字潤飾器。輸入是語音辨識的�
 
 
 def db():
+    # raw_b 是舊版精準模式（Breeze）留下的欄位，新紀錄留空
     conn = sqlite3.connect(DATA / "history.db")
     conn.execute(
         """create table if not exists history (
@@ -271,21 +238,19 @@ class WarmClaude:
 claude = WarmClaude()
 
 
-def refine(a, b, ctx, terms):
+def refine(a, ctx, terms):
     parts = [f"<context>\n{context_block(ctx)}\n</context>"]
     if terms:
         parts.append("<dictionary>" + "、".join(terms) + "</dictionary>")
-    parts.append(f"<a>{a}</a>" + (f"\n<b>{b}</b>" if b else ""))
+    parts.append(f"<a>{a}</a>")
     return claude.ask("\n".join(parts))
 
 
-def looks_wrong(refined, a, b):
+def looks_wrong(refined, a):
     """LLM 沒有乖乖潤飾（變成回答問題、寫說明）時，長度通常會跟辨識結果差很多。"""
     if not refined:
         return True
-    lengths = [len(x) for x in (a, b) if x]
-    hi, lo = max(lengths), min(lengths)
-    return len(refined) > hi * 1.8 + 20 or len(refined) < lo * 0.4
+    return len(refined) > len(a) * 1.8 + 20 or len(refined) < len(a) * 0.4
 
 
 def dictate(payload):
@@ -298,7 +263,7 @@ def dictate(payload):
     timings = {}
 
     if duration < 0.3 or np.sqrt(np.mean(audio ** 2)) < 0.002:
-        return {"id": rid, "text": "", "raw_a": "", "raw_b": "", "timings": {"skipped": "silence"}}
+        return {"id": rid, "text": "", "raw_a": "", "timings": {"skipped": "silence"}}
 
     path = REC / f"{rid}.wav"
     path.write_bytes(audio_bytes)
@@ -307,33 +272,27 @@ def dictate(payload):
     t = time.perf_counter()
     a = apply_fixes(asr(audio, MODEL_A, terms), fixes)
     timings["asr_a"] = round(time.perf_counter() - t, 2)
-    # 預設只跑 turbo；精準模式才加跑 Breeze（多約 1 秒，關鍵詞測試 19/22 → 20/22）
-    b = ""
-    if payload.get("accurate"):
-        t = time.perf_counter()
-        b = apply_fixes(asr(audio, MODEL_B, terms), fixes)
-        timings["asr_b"] = round(time.perf_counter() - t, 2)
 
     refined, fallback = "", False
-    if a or b:
+    if a:
         t = time.perf_counter()
-        refined = refine(a, b, ctx, terms)  # 逾時會回空字串，下面的防呆會退回辨識結果
+        refined = refine(a, ctx, terms)  # 逾時會回空字串，下面的防呆會退回辨識結果
         timings["llm"] = round(time.perf_counter() - t, 2)
         timings.update(claude.last)
-        if looks_wrong(refined, a, b):
+        if looks_wrong(refined, a):
             fallback = True
-    final = s2t.convert(a or b) if fallback else refined  # a、b 已濾掉幻覺，空的那份不會被選到
+    final = s2t.convert(a) if fallback else refined
     timings["total"] = round(time.perf_counter() - t0, 2)
 
     with db() as conn:
         conn.execute(
             "insert into history values (?,?,?,?,?,?,?,?,?,?,?)",
-            (rid, datetime.now(timezone.utc).isoformat(), round(duration, 2), a, b, refined,
+            (rid, datetime.now(timezone.utc).isoformat(), round(duration, 2), a, "", refined,
              final, int(fallback), json.dumps(ctx, ensure_ascii=False),
              json.dumps(timings), str(path)),
         )
     print(f"[{duration:5.1f}s] {timings} {'(fallback) ' if fallback else ''}{final[:60]}", flush=True)
-    return {"id": rid, "text": final, "raw_a": a, "raw_b": b, "timings": timings}
+    return {"id": rid, "text": final, "raw_a": a, "timings": timings}
 
 
 def warm_up():
@@ -358,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"ok": True, "models": list(_models),
+            self._send(200, {"ok": True, "models": [MODEL_A],
                              "gpu_mb": round(mx.get_active_memory() / 2**20),
                              "cache_mb": round(mx.get_cache_memory() / 2**20)})
         else:
@@ -384,9 +343,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print("載入模型中…", flush=True)
     silence = np.zeros(16000, np.float32)
-    # 只預載 turbo；Breeze 等精準模式第一次用到才載
     mlx_whisper.transcribe(silence, path_or_hf_repo=MODEL_A, language="zh")
     mx.clear_cache()
-    threading.Thread(target=_unload_idle_loop, daemon=True).start()
     print(f"VoiceType 服務啟動：http://{HOST}:{PORT}", flush=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

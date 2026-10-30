@@ -17,11 +17,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let serverItem = NSMenuItem(title: "辨識服務：啟動中…", action: nil, keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "登入時自動開啟", action: #selector(toggleLogin), keyEquivalent: "")
-    private let accurateItem = NSMenuItem(title: "精準模式（雙模型，慢約 1 秒）", action: #selector(toggleAccurate), keyEquivalent: "")
-    private var accurate: Bool {
-        get { UserDefaults.standard.bool(forKey: "accurateMode") }
-        set { UserDefaults.standard.set(newValue, forKey: "accurateMode") }
-    }
 
     /// 伺服器網址可用 `defaults write tw.mixxin.voicetype serverURL http://…` 改成公司主機
     private let server = ServerManager(
@@ -53,9 +48,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.target = self
             menu.addItem(item)
         }
-        accurateItem.target = self
-        accurateItem.state = accurate ? .on : .off
-        menu.addItem(accurateItem)
         loginItem.target = self
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(loginItem)
@@ -193,13 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         server.stop()
     }
 
-    @objc private func toggleAccurate() {
-        accurate.toggle()
-        accurateItem.state = accurate ? .on : .off
-    }
-
     func menuWillOpen(_ menu: NSMenu) {
-        accurateItem.state = accurate ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
@@ -284,7 +270,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "audio_b64": wav.base64EncodedString(),
             "context": context,
-            "accurate": accurate,
         ])
         URLSession.shared.dataTask(with: req) { data, _, error in
             DispatchQueue.main.async { self.handle(data: data, error: error) }

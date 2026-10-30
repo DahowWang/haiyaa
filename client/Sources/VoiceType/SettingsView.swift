@@ -5,7 +5,6 @@ import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
-    @AppStorage("accurateMode") private var accurateMode = false
     @AppStorage("serverURL") private var serverURL = "http://127.0.0.1:5577"
     @State private var serverDraft = ""
     @State private var serverMessage: String?
@@ -38,12 +37,6 @@ struct SettingsView: View {
     private var preferences: some View {
         VStack(alignment: .leading, spacing: 18) {
             Label("一般", systemImage: "slider.horizontal.3").font(.headline)
-            Toggle(isOn: $accurateMode) {
-                settingLabel("精準模式", detail: "用兩個模型一起辨識，較準，但要多等約 1 秒")
-            }
-            .toggleStyle(.switch)
-            .tint(Appearance.emphasis)
-            Divider()
             Toggle(isOn: Binding(get: { loginEnabled }, set: setLogin)) {
                 settingLabel("登入時自動開啟", detail: "登入 Mac 後，Haiyaa 就在選單列等你")
             }
