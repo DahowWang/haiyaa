@@ -88,8 +88,8 @@ private struct MainView: View {
         } detail: {
             Group {
                 switch destination ?? .home {
-                case .home: HomeView(history: history, showHistory: { destination = .history })
-                case .history: HistoryView(history: history)
+                case .home: HomeView(history: history, dictionary: dictionary, showHistory: { destination = .history })
+                case .history: HistoryView(history: history, dictionary: dictionary)
                 case .dictionary: DictionaryView(store: dictionary)
                 case .settings: SettingsView()
                 }
@@ -123,6 +123,7 @@ struct PageHeading: View {
 
 private struct HomeView: View {
     @ObservedObject var history: HistoryStore
+    @ObservedObject var dictionary: DictionaryStore
     let showHistory: () -> Void
 
     var body: some View {
@@ -164,7 +165,7 @@ private struct HomeView: View {
                 } else {
                     VStack(spacing: 0) {
                         ForEach(history.entries.prefix(5)) { entry in
-                            HistoryRow(entry: entry)
+                            HistoryRow(entry: entry, dictionary: dictionary)
                             if entry.id != history.entries.prefix(5).last?.id { Divider().padding(.horizontal, 16) }
                         }
                     }
@@ -201,6 +202,7 @@ private struct StatCard: View {
 
 private struct HistoryView: View {
     @ObservedObject var history: HistoryStore
+    @ObservedObject var dictionary: DictionaryStore
     @State private var search = ""
     private var filtered: [HistoryEntry] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -211,7 +213,7 @@ private struct HistoryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            PageHeading(title: "每一句，都在這裡", subtitle: "剛剛說過的話，可以在這裡找回來、複製再用。")
+            PageHeading(title: "每一句，都在這裡", subtitle: "找回說過的話，也能把聽錯的詞加入詞庫，讓下次更準。")
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("搜尋文字、App 或時間", text: $search).textFieldStyle(.plain)
@@ -234,7 +236,7 @@ private struct HistoryView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(filtered) { entry in
-                            HistoryRow(entry: entry)
+                            HistoryRow(entry: entry, dictionary: dictionary)
                                 .background(Appearance.card, in: RoundedRectangle(cornerRadius: 12))
                         }
                     }
@@ -260,8 +262,15 @@ private struct HistoryEmptyView: View {
 
 private struct HistoryRow: View {
     let entry: HistoryEntry
+    @ObservedObject var dictionary: DictionaryStore
     @State private var expanded = false
     @State private var copied = false
+    @State private var correction: Correction?
+    @State private var learned = false
+    private struct Correction: Identifiable {
+        let id = UUID()
+        let misheard: String
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -288,37 +297,68 @@ private struct HistoryRow: View {
             .accessibilityHint(expanded ? "收合細節" : "展開辨識細節")
             if expanded {
                 Divider()
-                Text(entry.final.isEmpty ? "（沒有文字）" : entry.final).textSelection(.enabled)
-                rawText("原始辨識", text: entry.rawA)
-                if !entry.rawB.isEmpty { rawText("原始辨識（Breeze）", text: entry.rawB) }
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("辨識結果").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        Spacer()
+                        Label("框選文字，立即修正", systemImage: "cursorarrow.rays")
+                            .font(.caption).foregroundStyle(Appearance.accent)
+                    }
+                    HistorySelectableText(text: entry.final.isEmpty ? "（沒有文字）" : entry.final) {
+                        beginCorrection($0)
+                    }
+                    .accessibilityLabel("辨識結果，框選文字即可修正")
+                }
                 HStack {
-                    Label(entry.usedFallback ? "已退回原始辨識" : "未使用退回結果",
-                          systemImage: entry.usedFallback ? "arrow.uturn.backward" : "checkmark.circle")
-                        .foregroundStyle(entry.usedFallback ? Appearance.error : Color.secondary)
+                    Button { beginCorrection() } label: { Label("修正誤聽", systemImage: "text.badge.plus") }
+                    .buttonStyle(.plain).foregroundStyle(Appearance.accent)
+                    .disabled(entry.final.isEmpty && entry.rawA.isEmpty)
+                    if learned {
+                        Label("已加入詞庫，下次辨識生效", systemImage: "checkmark.circle")
+                            .font(.caption).foregroundStyle(Appearance.accent)
+                    }
                     Spacer()
                     Button {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(entry.final, forType: .string)
                         copied = true
                     } label: { Label(copied ? "已複製" : "複製", systemImage: copied ? "checkmark" : "doc.on.doc") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
                 }
-                .font(.caption)
-                VStack(spacing: 7) {
-                    timing("錄音長度", seconds: entry.duration)
-                    ForEach(entry.timings.keys.sorted(), id: \.self) { key in
-                        timing(timingName(key), seconds: entry.timings[key] ?? 0)
+                .font(.callout)
+                Divider()
+                DisclosureGroup("原始辨識與耗時") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        rawText("原始辨識", text: entry.rawA)
+                        if !entry.rawB.isEmpty { rawText("原始辨識（Breeze）", text: entry.rawB) }
+                        if entry.usedFallback {
+                            Label("已退回原始辨識", systemImage: "arrow.uturn.backward").foregroundStyle(Appearance.error)
+                        }
+                        timing("錄音長度", seconds: entry.duration)
+                        ForEach(["asr_a", "asr_b", "llm", "total", "context", "refine", "decode"].filter { entry.timings[$0] != nil }, id: \.self) { key in
+                            timing(timingName(key), seconds: entry.timings[key] ?? 0)
+                        }
                     }
+                    .padding(.top, 10)
                 }
                 .font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(16)
+        .sheet(item: $correction) { correction in
+            HistoryCorrectionView(entry: entry, dictionary: dictionary, misheard: correction.misheard) { learned = true }
+        }
+    }
+
+    private func beginCorrection(_ misheard: String = "") {
+        dictionary.load()
+        correction = Correction(misheard: misheard)
     }
 
     private func rawText(_ title: String, text: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
-            Text(text.isEmpty ? "沒有辨識內容" : text).font(.callout).textSelection(.enabled)
+            HistorySelectableText(text: text.isEmpty ? "沒有辨識內容" : text) { beginCorrection($0) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12).background(Appearance.inset, in: RoundedRectangle(cornerRadius: 8))

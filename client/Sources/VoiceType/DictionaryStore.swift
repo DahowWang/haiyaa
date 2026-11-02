@@ -101,6 +101,48 @@ final class DictionaryStore: ObservableObject {
         _ = persist(updated)
     }
 
+    /// 從歷史紀錄學一個誤聽詞；同一個正確寫法合併到既有項目。
+    @discardableResult
+    func learn(correct: String, misheard: String) -> Bool {
+        let correct = correct.trimmingCharacters(in: .whitespacesAndNewlines)
+        let misheard = misheard.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !correct.isEmpty, !correct.hasPrefix("#"),
+              correct.rangeOfCharacter(from: CharacterSet(charactersIn: ":：\r\n")) == nil,
+              !misheard.isEmpty,
+              misheard.rangeOfCharacter(from: CharacterSet(charactersIn: "、,，\r\n")) == nil,
+              correct != misheard else {
+            error = "請填寫一個聽錯的詞和不同的正確寫法，不要貼入整句或多個詞。"
+            return false
+        }
+
+        func aliases(_ line: DictionaryLine) -> [String] {
+            DictionaryDocument.normalizedAliases(line.aliases).components(separatedBy: "、").filter { !$0.isEmpty }
+        }
+        if let conflict = document.lines.first(where: {
+            $0.kind == .mapping && $0.correct.caseInsensitiveCompare(correct) != .orderedSame &&
+            aliases($0).contains { $0.caseInsensitiveCompare(misheard) == .orderedSame }
+        }) {
+            error = "「\(misheard)」已對應「\(conflict.correct)」，請先到詞庫編輯原有對照。"
+            return false
+        }
+
+        var updated = document
+        let index = updated.lines.firstIndex { $0.kind == .mapping && $0.correct.caseInsensitiveCompare(correct) == .orderedSame }
+            ?? updated.lines.firstIndex { $0.kind == .word && $0.correct.caseInsensitiveCompare(correct) == .orderedSame }
+        if let index {
+            var words = updated.lines[index].kind == .mapping ? aliases(updated.lines[index]) : []
+            if !words.contains(where: { $0.caseInsensitiveCompare(misheard) == .orderedSame }) { words.append(misheard) }
+            updated.lines[index].kind = .mapping
+            updated.lines[index].correct = correct
+            updated.lines[index].aliases = words.joined(separator: "、")
+            updated.lines[index].edited = true
+        } else {
+            updated.lines.append(DictionaryLine(kind: .mapping, original: "", correct: correct,
+                                                aliases: misheard, edited: true))
+        }
+        return persist(updated)
+    }
+
     private func diskText() throws -> String {
         do { return try String(contentsOf: url, encoding: .utf8) }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {

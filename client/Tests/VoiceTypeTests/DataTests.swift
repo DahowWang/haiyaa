@@ -63,6 +63,55 @@ final class DataTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), invalid)
     }
 
+    func testLearnMergesAliasesAndPreservesUnrelatedDictionaryContent() throws {
+        let url = directory.appendingPathComponent("dictionary.txt")
+        try "# 保留註解\n王大皓\nHaiyaa:嗨呀,海呀\n".write(to: url, atomically: true, encoding: .utf8)
+        let store = DictionaryStore(url: url)
+        store.load()
+        XCTAssertTrue(store.learn(correct: " Haiyaa ", misheard: " 海亞 "))
+        XCTAssertTrue(store.learn(correct: "Haiyaa", misheard: "海亞"))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "# 保留註解\n王大皓\nHaiyaa：嗨呀、海呀、海亞\n")
+    }
+
+    func testLearnPromotesExistingWordAndAllowsSpellingCaseCorrection() throws {
+        let url = directory.appendingPathComponent("dictionary.txt")
+        try "# 詞庫\nGitHub\n".write(to: url, atomically: true, encoding: .utf8)
+        let store = DictionaryStore(url: url)
+        store.load()
+        XCTAssertTrue(store.learn(correct: "GitHub", misheard: "github"))
+        XCTAssertTrue(store.learn(correct: "GitHub", misheard: "GITHUB"))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "# 詞庫\nGitHub：github\n")
+    }
+
+    func testLearnAddsNewMappingAndRejectsConflictingAlias() throws {
+        let url = directory.appendingPathComponent("dictionary.txt")
+        let store = DictionaryStore(url: url)
+        store.load()
+        XCTAssertTrue(store.learn(correct: "Haiyaa", misheard: "海呀"))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "\nHaiyaa：海呀")
+        XCTAssertFalse(store.learn(correct: "其他品牌", misheard: "海呀"))
+        XCTAssertTrue(store.error?.contains("Haiyaa") == true)
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "\nHaiyaa：海呀")
+    }
+
+    func testLearnRejectsInvalidMappingsAndExternalChanges() throws {
+        let url = directory.appendingPathComponent("dictionary.txt")
+        let store = DictionaryStore(url: url)
+        store.load()
+        for (correct, misheard) in [("", "海呀"), ("Haiyaa", ""), ("同詞", "同詞"),
+                                    ("# 註解", "海呀"), ("正確：誤聽", "海呀"),
+                                    ("Haiyaa", "海呀，嗨呀"), ("Haiyaa", "海呀\n嗨呀")] {
+            XCTAssertFalse(store.learn(correct: correct, misheard: misheard))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        try "# 外部修改\n外部詞".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertFalse(store.learn(correct: "Haiyaa", misheard: "海呀"))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "# 外部修改\n外部詞")
+        store.load()
+        XCTAssertTrue(store.learn(correct: "Haiyaa", misheard: "海呀"))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "# 外部修改\n外部詞\nHaiyaa：海呀")
+    }
+
     func testMissingDatabaseIsNotCreated() {
         let url = directory.appendingPathComponent("missing.db")
         XCTAssertThrowsError(try HistoryReader.read(at: url))
